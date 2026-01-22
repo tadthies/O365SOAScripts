@@ -48,10 +48,11 @@
     .PARAMETER NoPasswordReset
     .PARAMETER NoMFA
     .PARAMETER NoDisableForwardingRules
-    .PARAMETER NoRevokeRefreshToken
+    .PARAMETER NoRevokeRefreshTokens
     .PARAMETER NoRemoveCalendarPublishing
     .PARAMETER NoRemoveDelegates
     .PARAMETER NoRemoveMailboxForwarding
+    .PARAMETER NoDisableMobileDevices
 
     .PARAMETER CloudEnvironment
         Cloud instance of the tenant. Possible values are Commercial, USGovGCC, USGovGCCHigh, USGovDoD, and China.
@@ -68,8 +69,8 @@
 		.\Remediate-CompromisedAccount.ps1 -UPN joe@contoso.com -NoMFA
 
 	.NOTES
-        Version 2.0
-		January 8, 2025
+        Version 2.1
+		January 22, 2026
 
 	.LINK
 		about_functions_advanced
@@ -85,7 +86,7 @@ Param(
     [switch]$NoMFA,
     [switch]$NoDisableForwardingRules,
     [switch]$NoRevokeRefreshTokens,
-    [switch]$NoDisableCalendarPublishing,
+    [switch]$NoRemoveCalendarPublishing,
     [switch]$NoRemoveDelegates,
     [switch]$NoRemoveMailboxForwarding,
     [switch]$NoDisableMobileDevices,
@@ -367,7 +368,7 @@ if ($NoPasswordReset -eq $false) {
 if ($NoMFA -eq $false) {
     $requiredScopes += 'Policy.ReadWrite.AuthenticationMethod'
 }
-if ($NoRevokeRefreshToken -eq $false) {
+if ($NoRevokeRefreshTokens -eq $false) {
     $requiredScopes += 'User.RevokeSessions.All'
 }
 if ($requiredScopes) {
@@ -442,7 +443,7 @@ if(!$NoPasswordReset) {$NewPassword = Reset-Password -UPN $UPN}
 if(!$NoMFA) {$MFAResult = Enable-MFA -UPN $UPN}
 if(!$NoRevokeRefreshTokens) {$RevokeResult = Revoke-RefreshToken -UPN $UPN}
 if(!$NoDisableForwardingRules) {$ForwardingRulesResult = Disable-ForwardingRules -UPN $UPN}
-if(!$NoDisabledCalendarPublishing) {$CalPublishingResult = Remove-CalendarPublishing -UPN $UPN -MailboxIdentity $Mailbox.Identity}
+if(!$NoRemoveCalendarPublishing) {$CalPublishingResult = Remove-CalendarPublishing -UPN $UPN -MailboxIdentity $Mailbox.Identity}
 if(!$NoRemoveDelegates) {$DelegatesResult = Remove-MailboxDelegates -UPN $UPN}
 if(!$NoRemoveMailboxForwarding) {$ForwardingResult = Remove-MailboxForwarding -UPN $UPN}
 if(!$NoDisableMobileDevices) {$MobileDevicesResult = Disable-MobileDevices -UPN $UPN}
@@ -453,7 +454,7 @@ if(!$NoDisableMobileDevices) {$MobileDevicesResult = Disable-MobileDevices -UPN 
 
 Write-Host "`n`nRemediation report for $UPN" -ForegroundColor Green
 if(!$NoPasswordReset) {
-    if (-not $NewPassword){
+    if ($NewPassword){
         Write-Host "New Password: $NewPassword"
     }
 }
