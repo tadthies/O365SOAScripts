@@ -1,4 +1,4 @@
-﻿#requires -Modules ExchangeOnlineManagement
+﻿#requires -Modules Microsoft.Graph.Authentication
 ##############################################################################################
 #This sample script is not supported under any Microsoft standard support program or service.
 #Microsoft further disclaims all implied warranties including, without limitation, any implied
@@ -15,174 +15,147 @@
 	.Synopsis
 		Get the configured third-party storage providers for a given mailbox.
 	.Description
-		Using Exchange Web Services, any third-party storage providers configured for a mailbox (which can be
-		configured via Outlook on the web) will be retrieved, including the account name configured
-		for a given provider. Supports client secret and certificate authentication.
-
-		* Important: Requires the EWS Managed API to be installed on the local machine.
-			1. Run PowerShell as Administrator
-			2. Run the following: Install-Package Microsoft.Exchange.Webservices
-			   Note: If NuGet is not a registered package source:
-			   https://learn.microsoft.com/en-us/powershell/gallery/powershellget/supported-repositories
-		* Important: Requires an Entra ID app registration configured for app-only authentication
-		  with EWS.AccessAsApp (full_access_as_app).
-		    Details for registering an app and adding the role to the manifest:
-		    https://learn.microsoft.com/en-us/exchange/client-developer/exchange-web-services/how-to-authenticate-an-ews-application-by-using-oauth#register-your-application
-			Note: Enter the application ID and tenant's default routing domain in the variables at the top of the begin block.
-		* Important: Requires the corresponding enterprise application (service principal) to have a role assignment
-		  with the "Application EWS.AccessAsApp" role (and a scope that includes the desired mailboxes).
-			Details for creating the service principal link and management role assignment in EXO:
-			https://learn.microsoft.com/en-us/exchange/permissions-exo/application-rbac
-	.Parameter EmailAddress
-		Email address of the mailbox from which to retrieve the configuration. Supports pipeline input
-		of email addresses or objects with an EmailAddress or PrimarySMTPAddress property, such as
-		with Get-Mailbox.
-	.Parameter Cloud
-		Office 365 environment which hosts the mailboxes. Valid values are Commercial, USGovGCC, China.
-		Default value is Commercial. The feature is not available in GCC High and DoD. Unknown if available in China.
-	.Parameter CertificateAuthentication
-		Use a certificate for authentication instead of a client secret. The app registration must have a
-		certificate uploaded, installed on the local machine in Current User\Personal\Certificates,
-		and the thumbprint specified in the variables region below.
+		Using Microsoft Graph, get any storage providers configured for a mailbox (which can be
+		configured via Outlook on the web) and output third-party providers and the account name
+		configured for a given provider.
+		
+		Requires an app registration with the application permission MailboxConfigItem.Read.
+	.Parameter UserId
+		UPN or Entra object ID of the mailbox. Supports pipeline input
+		of UPNs, email addresses (if they are the same as the UPN), object IDs, or objects with
+		an Id or UserPrincipalName property, such as with Get-MgUser and Get-Mailbox.
+	.Parameter CloudEnvironment
+		Office 365 cloud environment for the tenant. Valid values are Commercial, USGovGCC,
+		USGovGCCHigh, USGovDoD, and China. Default value is Commercial.
+	.Parameter ApplicationId
+		Application (client) ID of the app registration to use for connecting to Microsoft Graph.
+		This can be stored in the script or provided at runtime.
+	.Parameter ClientSecret
+		PSCredential object containing a valid client secret for the app registration. If not provided and
+		a certificate thumbprint has not been stored in the script, the script will prompt for the client secret.
+		(If used, it will be used instead of the certificate thumbprint stored in the script. Cannot be used
+		if CertificateThumbprint parameter is used.)
+	.Parameter CertificateThumbprint
+		Thumbprint of a certificate for the app registration to use for authentication. This can be stored in the script
+		If not used or a thumbprint is not stored in the script, client secret authentication will be used.
+		(Cannot be used if ClientSecret parameter is used.)
+	.Parameter TenantId
+		Tenant ID or tenant domain of the tenant. This can be stored in the script or provided at runtime.
 	.Example
-		.\Get-MailboxOWAStorageProvider johndoe@contoso.com
-		Get-Mailbox -RecipientTypeDetails UserMailbox -ResultSize unlimited | .\Get-MailboxOWAStorageProvider
+		Get-MailboxOWAStorageProvider johndoe@contoso.com
+		Get-MailboxOWAStorageProvider johndoe@contoso.com -ClientSecret (Get-Credential -UserName "DoesNotMatter")
+		Get-Mailbox | Get-MailboxOWAStorageProvider
+
 	.Notes
-		Version: 1.2
-		Date: August 13, 2025
+		Version: 2.0
+		Date: June 2, 2026
 #>
 
-[CmdletBinding()]
+[CmdletBinding(DefaultParameterSetName='CS')]
 param (
-	[Parameter(Mandatory=$true,ValueFromPipelinebyPropertyName=$true,Position=0)][Alias('PrimarySMTPAddress')][string]$EmailAddress,
-	[ValidateSet('Commercial','USGovGCC','China')][string]$Cloud = 'Commercial',
-	[switch]$CertificateAuthentication
+	[Parameter(Mandatory=$true,ValueFromPipeline=$true,ValueFromPipelinebyPropertyName=$true,Position=0)][Alias('UserPrincipalName','Id')][string]$UserId,
+	[ValidateSet('Commercial','USGovGCC','USGovGCCHigh','USGovDoD','China')][string]$CloudEnvironment = 'Commercial',
+	[string]$ApplicationId, # Can set a default value here so it does not need to be provided every time the script is run
+	[string]$TenantId, # Can set a default value here so it does not need to be provided every time the script is run
+	[Parameter(ParameterSetName='CS')][PSCredential]$ClientSecret,
+	[Parameter(ParameterSetName='CT')][string]$CertificateThumbprint # If you want to set a default value, do not set it here, but in the Begin block
 )
 
 begin {
-	# Variables
-	$tenantDomain = 'tenantname.onmicrosoft.com' # Default routing domain of the tenant
-	$appId = '00000000-0000-0000-0000-000000000000' # Application ID of the app registration in Entra ID with EWS permission
-	$certThumbprint = '' # Thumbprint of the certificate to use for authentication if CertificateAuthentication switch is used
-	# End variables
+	$certThumbprint = '' # If using cert auth, you can specify the certificate thumbprint here if you want to use it every time without having to provide it when running the script.
 
-	if ($tenantDomain -like "tenantname*" -or $appId -like "00000000*") {
-		Write-Error "The tenant domain or application ID has not been specified in the Variables section of the `"begin`" block."
-		break
-	}
-	if ($CertificateAuthentication -and -not $certThumbprint) {
-		Write-Error "The certificate thumbprint has not been specified in the Variables section of the `"begin`" block."
-		break
+	$connectionState = Get-MgContext
+	if ($connectionState.AuthType -eq 'AppOnly' -and $connectionState.Scopes -contains 'MailboxConfigItem.Read') {
+		# Already connected with app authentication that has the required permission
+		Write-Verbose -Message "Will use existing Graph connection because it meets requirements."
+		return
 	}
 
-	# Check for EWS API installed via NuGet
-	# If already loaded, save time by reusing the loaded type
-	if (-not('Microsoft.Exchange.WebServices.Data.ExchangeVersion' -as [type])) {
-		Write-Verbose 'EWS Managed API is not loaded. Checking if package is installed...'
-		$apiPackage = Get-Package -Name Microsoft.Exchange.Webservices
-		if ($apiPackage) {
-			$dllName = 'microsoft.exchange.webservices.dll'
-			try {
-				Write-Verbose "Loading EWS Managed API from $((Get-Item $apiPackage.Source).DirectoryName)"
-				Add-Type -Path (Join-Path -Path (Get-ChildItem -Path (Get-Item $apiPackage.Source).DirectoryName -Recurse -Filter $dllName | 
-				Select-Object -ExpandProperty DirectoryName) -ChildPath $dllName) -ErrorAction Stop | Out-Null
-			}
-			catch {
-				Write-Error $_
-				break
-			}
+	# ApplicationId and TenantId are not required parameters so the script can use an existing connection without requiring them to be provided.
+	# If existing connection does not exist and they were not provided or default not set, prompt for them.
+	while (-not($ApplicationId)) {
+		$ApplicationId = Read-Host -Prompt "Enter the application (client) ID of the app registration to use"
+	}
+	while (-not($TenantId)) {
+		$TenantId = Read-Host -Prompt "Enter the tenant ID or tenant domain of the tenant"
+	}
+
+	# If no auth provided and no cert stored, prompt for secret. Otherwise, certificate will be used
+	if ($PSCmdlet.ParameterSetName -eq 'CS' -and $certThumbprint -eq '') {
+        while ($null -eq $ClientSecret -or $ClientSecret.Password.Length -eq 0) {
+            # UserName is a required parameter for Get-Credential but the value is not used
+            $ClientSecret = (Get-Credential -Message "Enter a valid client secret for the app registration in the password field." -UserName "DoesNotMatter")
+        }
+	}
+	
+	switch ($CloudEnvironment) {
+		"Commercial"   {$cloud = "Global"}
+		"USGovGCC"     {$cloud = "Global"}
+		"USGovGCCHigh" {$cloud = "USGov"}
+		"USGovDoD"     {$cloud = "USGovDoD"}
+		"China"        {$cloud = "China"}            
+	}
+
+	# Set the arguments to be used with Connect-MgGraph
+	if ($ClientSecret) {
+    	$connectionArguments = @{
+			Environment = $cloud
+			ContextScope = "Process"
+			ClientSecretCredential = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList ($ApplicationId, $ClientSecret.Password)
+			TenantId = $TenantId
 		}
-		else {
-			Write-Error 'The Exchange Web Services Managed API is not installed from NuGet and is required by this script.' -Category NotInstalled
-			break
+	} else {
+		$connectionArguments = @{
+			Environment = $cloud
+			ContextScope = "Process"
+			CertificateThumbprint = $(if ($CertificateThumbprint) { $CertificateThumbprint } else { $certThumbprint })
+			ClientId = $ApplicationId
+			TenantId = $TenantId
 		}
 	}
-	else {
-		Write-Verbose 'Using the EWS Managed API that is already loaded.'
+
+    Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+    #Write-Host -ForegroundColor Green "$(Get-Date) Connecting to Microsoft Graph with application authentication..."
+    Connect-MgGraph @connectionArguments | Out-Null
+	if (-not(Get-MgContext)) {
+		Write-Error -Message "Failed to connect to Microsoft Graph. Check the error message and ensure that the script's app registration details and credential information (secret or certificate) are correct."
+		throw
+	} elseif ((Get-MgContext).Scopes -notcontains 'MailboxConfigItem.Read') {
+		Write-Error -Message "The app registration does not have the MailboxConfigItem.Read permission. Ensure that admin consent has been granted for the permission in the app registration."
+		throw
 	}
 
-	# Import MSAL from Exchange Online module
-	if (-not('Microsoft.Identity.Client.ConfidentialClientApplicationBuilder' -as [type])) {
-		Write-Verbose 'Loading the MSAL from EXO module installation...'
-		if ($PSEdition -eq 'Core') {$folder = 'netCore'} else {	$folder = 'NetFramework'}
-		$ExoModule = Get-Module -Name ExchangeOnlineManagement -ListAvailable | Sort-Object -Property Version -Descending | Select-Object -First 1
-		$MSAL = Join-Path -Path $ExoModule.ModuleBase -ChildPath "$($folder)\Microsoft.Identity.Client.dll"
-		Add-Type -Path $MSAL | Out-Null
-	}
-	else {
-		Write-Verbose 'Using the MSAL that is already loaded.'
-	}
-
-	switch ($Cloud) {
-	    'Commercial'    { $base = 'https://login.microsoftonline.com/';$ewsUrl = 'https://outlook.office365.com'}
-	    'USGovGCC'      { $base = 'https://login.microsoftonline.com/';$ewsUrl = 'https://outlook.office365.com'}
-	    'China'         { $base = 'https://login.partner.microsoftonline.cn/';$ewsUrl = 'https://partner.outlook.cn'}
-	}
-	# Build client app and get access token
-	$replyUri = $base + 'common/oauth2/nativeclient'
-	$capabilities = New-Object System.Collections.Generic.List[string]
-	# cp1 indicates support for CAE, which will result in an access token that is valid for 29 hours
-	# (This helps collecting from all mailboxes in a large org without needing to include support for token expiration.)
-	$capabilities.Add('cp1')
-	if ($CertificateAuthentication) {
-		# Use certificate authentication
-		$cert = Get-Item "Cert:\CurrentUser\My\$certThumbprint"
-		if (-not $cert) {
-			Write-Error "The certificate with thumbprint $certThumbprint was not found in the CurrentUser\My store."
-			break
-		}
-		$confidentialClient = [Microsoft.Identity.Client.ConfidentialClientApplicationBuilder]::Create($appId).WithRedirectUri($replyUri).WithCertificate($cert).WithTenantId($tenantDomain).WithClientCapabilities($capabilities).Build()
-	}
-	else {
-		# Use client secret authentication
-		$ssAppSecret = (Get-Credential -Message "Enter the app registration's client secret in the password field." -UserName "EWS Application").Password
-		$bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($ssAppSecret)
-		$appSecret = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
-		[System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
-		$confidentialClient = [Microsoft.Identity.Client.ConfidentialClientApplicationBuilder]::Create($appId).WithRedirectUri($replyUri).WithClientSecret($appSecret).WithTenantId($tenantDomain).WithClientCapabilities($capabilities).Build()
-	}
-	$scope = New-Object System.Collections.Generic.List[string]
-	$scope.Add("$ewsUrl/.default")
-	$token = $confidentialClient.AcquireTokenForClient($scope).ExecuteAsync().GetAwaiter().GetResult()
-	if (-not $CertificateAuthentication) {
-		Remove-Variable -Name appSecret,ssAppSecret -ErrorAction SilentlyContinue
-	}
 }
 
 process {
-	if ($token.AccessToken) {
-		Write-Progress -Activity 'Getting OWA storage provider settings' -CurrentOperation "Mailbox $EmailAddress"
-		# Create EWS service object
-		$exchangeVersion = [Microsoft.Exchange.WebServices.Data.ExchangeVersion]::Exchange2013_SP1
-		$exchangeService = New-Object -TypeName Microsoft.Exchange.WebServices.Data.ExchangeService($exchangeVersion)
-		$exchangeService.Credentials = New-Object -TypeName Microsoft.Exchange.WebServices.Data.OauthCredentials($token.AccessToken)
-		$exchangeService.Url = $ewsUrl+'/EWS/Exchange.asmx'
-		$exchangeService.ImpersonatedUserId = New-Object -TypeName Microsoft.Exchange.WebServices.Data.ImpersonatedUserId([Microsoft.Exchange.WebServices.Data.ConnectingIdType]::SmtpAddress,$EmailAddress)
-		$exchangeService.HttpHeaders.Add('X-AnchorMailbox', $EmailAddress)
-		$folderId = New-Object -TypeName Microsoft.Exchange.WebServices.Data.FolderId([Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::Root,$EmailAddress)
-
-		# Get IPM.Configuration message for OWA attachment providers and the roaming dictionary property that contains the settings
-		try {
-			$userConfig = [Microsoft.Exchange.WebServices.Data.UserConfiguration]::Bind($exchangeservice, 'OWA.AttachmentDataProvider', $folderId, [Microsoft.Exchange.WebServices.Data.UserConfigurationProperties]::All)
-			if ($userConfig) {
-				# Convert byte array of the settings to string
-				[xml]$xmlString = [System.Text.Encoding]::ASCII.GetString($userConfig.XmlData)
-				foreach ($sp in $xmlString.AttachmentDataProvider.entry) {
-					# Include in output only third-party providers
-					if ($sp.isThirdPartyProvider -eq $true) {	
-						New-Object -TypeName psobject -Property @{
-						    Mailbox = $EmailAddress
-						    ProviderName = $sp.DisplayName
-						    ProviderAccount = $sp.associatedDataProviderAccountId
-						}
+	Write-Progress -Activity 'Getting OWA storage provider settings' -CurrentOperation "Mailbox for $UserId"
+	$uriSegment = "/beta/users/$UserId/mailFolders/root/userConfigurations/OWA.AttachmentDataProvider"
+	# Get IPM.Configuration message for OWA attachment provider (which has a roaming dictionary property that contains the settings)
+	try {
+		$userConfig = Invoke-MgGraphRequest -Method GET -Uri $uriSegment -OutputType PSObject
+		if ($userConfig.xmlData) {
+			# Convert Base64 byte array (binary) to string
+			[xml]$xmlString = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($userConfig.xmlData))
+			foreach ($sp in $xmlString.AttachmentDataProvider.entry) {
+				# Include in output only third-party providers
+				if ($sp.isThirdPartyProvider -eq $true) {	
+					New-Object -TypeName psobject -Property @{
+						Id = $UserId
+						ProviderName = $sp.DisplayName
+						ProviderAccount = $sp.associatedDataProviderAccountId
 					}
 				}
 			}
 		}
-		catch {
-			if ($_.Exception.InnerException -notlike "*The configuration object was not found.*") {
-				Write-Error $_
-			}
+	}
+	catch {
+		# Parse the response message that contains the OData error response in JSON
+		$responseError = (($_.ErrorDetails.Message -split "`r?`n`r?`n", 2)[1] | ConvertFrom-Json).error
+		if ($responseError.message -like "*specified object was not found in the store*") {
+			# Mailbox is valid but does not have any provider object, likely from the user never opening the mailbox or using OWA
+		
+		} else {
+			Write-Warning -Message "$UserId`: $($responseError.message)"
 		}
 	}
 }
